@@ -1,0 +1,193 @@
+import pandas as pd
+import numpy as np
+import os
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+# Crear ventana principal
+root = tk.Tk()
+root.withdraw()
+
+# Ventana de progreso
+progress_win = tk.Toplevel()
+progress_win.title("Procesando")
+progress_label = ttk.Label(progress_win, text="Iniciando...")
+progress_label.pack(padx=20, pady=10)
+progress_bar = ttk.Progressbar(progress_win, mode='indeterminate')
+progress_bar.pack(padx=20, pady=10)
+progress_bar.start()
+progress_win.update()
+
+# Selección de archivo
+messagebox.showinfo("Inicio", "Selecciona el archivo Excel con las hojas 'KSB1' y 'Mapeo'")
+file_path = filedialog.askopenfilename(title="Seleccionar archivo Excel", filetypes=[["Excel files", "*.xlsx *.xlsm"]])
+if not file_path:
+    messagebox.showerror("Error", "No se seleccionó ningún archivo.")
+    exit()
+
+start_time = time.time()
+
+try:
+    df_datos = pd.read_excel(file_path, sheet_name="KSB1")
+    df_mapeo = pd.read_excel(file_path, sheet_name="Mapeo")
+except Exception as e:
+    messagebox.showerror("Error al leer archivo", str(e))
+    progress_win.destroy()
+    exit()
+
+progress_label.config(text="Limpieza y preparación de datos...")
+progress_win.update()
+
+# Limpieza de encabezados
+df_mapeo.columns = df_mapeo.columns.str.strip()
+df_datos.columns = df_datos.columns.str.strip()
+df_mapeo.rename(columns={'Centro de coste': 'CC','Clase de coste': 'CTA'}, inplace=True)
+df_datos.rename(columns={'Centro de coste': 'CC','Clase de coste': 'CTA'}, inplace=True)
+if 'Rule_ID' not in df_mapeo.columns:
+    df_mapeo['Rule_ID'] = range(1, len(df_mapeo) + 1)
+
+for col in ['OU', 'CC', 'CTA']:
+    df_mapeo[col] = df_mapeo[col].astype(str).str.strip().replace(['nan', 'NaN', 'None', ''], '')
+    df_mapeo[col] = df_mapeo[col].apply(lambda x: str(int(float(x))) if x.replace('.', '', 1).isdigit() and float(x).is_integer() else x)
+
+    df_datos[col] = df_datos[col].astype(str).str.strip().replace(['nan', 'NaN', 'None', ''], '')
+    df_datos[col] = df_datos[col].apply(lambda x: str(int(float(x))) if x.replace('.', '', 1).isdigit() and float(x).is_integer() else x)
+
+cta_unicas = df_datos['CTA'].unique()
+df_mapeo = df_mapeo[df_mapeo['CTA'].isin(cta_unicas) | (df_mapeo['CTA'] == '')].copy()
+
+keywords_cols = ['Keyword 1', 'Keyword 2', 'Keyword 3']
+for i, col in enumerate(keywords_cols):
+    if col not in df_mapeo.columns:
+        posibles = [c for c in df_mapeo.columns if f'keyword {i+1}' in c.lower()]
+        if posibles:
+            df_mapeo.rename(columns={posibles[0]: col}, inplace=True)
+
+for col in keywords_cols:
+    df_mapeo[col] = df_mapeo[col].fillna('').astype(str).str.strip().str.lower()
+
+target_cols = ['Vendor', 'Concept', 'MainExpenseType', 'Type2', 'Exp2', 'Exp1',
+               'Layer', 'PL3', 'HQ_MU', 'Scope', 'Acc_Name', 'Funding_Bucket', 'Project',
+               'Function', 'Area', 'Resp', 'IT_Lead', 'Bucket2', 'Smart_Spending', 'Adj_Type']
+df_mapeo = df_mapeo.rename(columns={col: f"{col}_map" for col in target_cols})
+
+campos_texto = ['Denominación del objeto', 'Denom.clase de coste', 'Texto de pedido',
+                'Texto de cabecera de documento', 'Denominación', 'Denom.cuenta contrapartida',
+                'Denominacion cuenta contrapartida', 'Denominación del objeto del interlocutor',
+                'Objeto', 'Proveedor', 'Asignacion','Texto', 'Referencia', 'Objeto del interlocutor']
+campos_texto = [col for col in campos_texto if col in df_datos.columns]
+df_datos['input_text'] = df_datos[campos_texto].fillna('').astype(str).agg(' '.join, axis=1).str.lower()
+
+def sin_keywords(row):
+    return all(str(row[col]).strip() == '' for col in keywords_cols)
+
+df_sin_keywords = df_mapeo[df_mapeo.apply(sin_keywords, axis=1)].copy()
+df_con_keywords = df_mapeo[~df_mapeo.index.isin(df_sin_keywords.index)].copy()
+
+keywords_long = df_con_keywords.melt(
+    id_vars=[c for c in df_con_keywords.columns if c not in keywords_cols],
+    value_vars=keywords_cols,
+    value_name='keyword'
+).drop(columns='variable')
+keywords_long['keyword'] = keywords_long['keyword'].astype(str).str.strip().str.lower()
+keywords_long = keywords_long[keywords_long['keyword'] != '']
+
+progress_label.config(text="Procesando bloques de datos...")
+progress_win.update()
+
+from math import ceil
+bloques = np.array_split(df_datos, ceil(len(df_datos) / 1000))
+
+resultados = []
+
+for i, bloque in enumerate(bloques):
+    progress_label.config(text=f"Procesando bloque {i+1} de {len(bloques)} ...")
+    progress_win.update()
+    bloque = bloque.copy()
+    bloque['input_text'] = bloque[campos_texto].fillna('').astype(str).agg(' '.join, axis=1).str.lower()
+
+    cross = bloque.assign(key=1).merge(keywords_long.assign(key=1), on='key').drop('key', axis=1)
+    cross = cross.rename(columns={
+        'OU_y': 'OU_map', 'CC_y': 'CC_map', 'CTA_y': 'CTA_map',
+        'OU_x': 'OU', 'CC_x': 'CC', 'CTA_x': 'CTA'
+    }) if 'OU_y' in cross.columns else cross
+    cross = cross[
+        ((cross['OU_map'] == '') | (cross['OU'] == cross['OU_map'])) &
+        ((cross['CC_map'] == '') | (cross['CC'] == cross['CC_map'])) &
+        ((cross['CTA_map'] == '') | (cross['CTA'] == cross['CTA_map']))
+    ]
+
+    cross['keyword_match'] = cross.apply(lambda row: 1 if row['keyword'] in row['input_text'] else 0, axis=1)
+
+    match_counts = cross[cross['keyword_match'] == 1][['input_text', 'Rule_ID', 'keyword']].drop_duplicates().groupby(['input_text', 'Rule_ID']).size().reset_index(name='keyword_matches')
+
+
+    cross = cross.drop_duplicates(subset=['input_text', 'Rule_ID'])
+    cross = cross.merge(match_counts, on=['input_text', 'Rule_ID'], how='left').fillna({'keyword_matches': 0})
+
+    cross['keyword_matches'] = cross['keyword_matches'].astype(int)
+
+    cross['score'] = (
+        ((cross['OU_map'] == cross['OU']).astype(int) * 3 + (cross['OU_map'] == '').astype(int)) *
+        ((cross['CC_map'] == cross['CC']).astype(int) * 4 + (cross['CC_map'] == '').astype(int)) *
+        ((cross['CTA_map'] == cross['CTA']).astype(int) * 5 + (cross['CTA_map'] == '').astype(int)) *
+        cross['keyword_matches'].clip(lower=0)
+    )
+
+    cross_sin = bloque.assign(key=1).merge(df_sin_keywords.assign(key=1), on='key').drop('key', axis=1)
+    cross_sin = cross_sin.rename(columns={
+        'OU_y': 'OU_map', 'CC_y': 'CC_map', 'CTA_y': 'CTA_map',
+        'OU_x': 'OU', 'CC_x': 'CC', 'CTA_x': 'CTA'
+    }) if 'OU_y' in cross_sin.columns else cross_sin
+
+    cross_sin = cross_sin[
+        ((cross_sin['OU_map'] == '') | (cross_sin['OU'] == cross_sin['OU_map'])) &
+        ((cross_sin['CC_map'] == '') | (cross_sin['CC'] == cross_sin['CC_map'])) &
+        ((cross_sin['CTA_map'] == '') | (cross_sin['CTA'] == cross_sin['CTA_map']))
+    ]
+
+    cross_sin['score'] = (
+        ((cross_sin['OU_map'] == cross_sin['OU']).astype(int) * 3 + (cross_sin['OU_map'] == '').astype(int)) *
+        ((cross_sin['CC_map'] == cross_sin['CC']).astype(int) * 4 + (cross_sin['CC_map'] == '').astype(int)) *
+        ((cross_sin['CTA_map'] == cross_sin['CTA']).astype(int) * 5 + (cross_sin['CTA_map'] == '').astype(int))
+    )
+
+    cross_total = pd.concat([cross, cross_sin], ignore_index=True)
+    if not cross_total.empty:
+        idx_max = cross_total[cross_total['score'] > 0].groupby('input_text')['score'].idxmax()
+        mejores = cross_total.loc[idx_max].copy()
+
+        columnas_mapeadas = [f"{col}_map" for col in target_cols]
+        mejores['Matching_Explanation'] = mejores.apply(
+            lambda row: ', '.join(filter(None, [
+                'OU' if row['OU'] == row['OU_map'] else 'OU=*' if row['OU_map'] == '' else '',
+                'CC' if row['CC'] == row['CC_map'] else 'CC=*' if row['CC_map'] == '' else '',
+                'CTA' if row['CTA'] == row['CTA_map'] else 'CTA=*' if row['CTA_map'] == '' else '',
+                'keyword' if 'keyword_matches' in row and row['keyword_matches'] > 0 else ''
+            ])).strip(', '), axis=1)
+
+        resultado = bloque.merge(mejores[['input_text', 'Rule_ID', 'Matching_Explanation','score','keyword_matches'] + columnas_mapeadas], on='input_text', how='left')
+    else:
+        resultado = bloque.copy()
+        resultado['Matching_Explanation'] = 'No match'
+        resultado['Rule_ID'] = ''
+
+    resultados.append(resultado)
+
+final_result = pd.concat(resultados, ignore_index=True)
+
+progress_label.config(text="Guardando archivo Excel...")
+progress_win.update()
+
+output_path = os.path.splitext(file_path)[0] + "_Resultado.xlsx"
+with pd.ExcelWriter(os.path.splitext(file_path)[0] + "_debug_keywords.xlsx") as writer:
+    df_mapeo.to_excel(writer, sheet_name="Mapeo", index=False)
+    df_datos.to_excel(writer, sheet_name="Datos", index=False)
+final_result.to_excel(output_path, index=False)
+
+progress_bar.stop()
+progress_win.destroy()
+
+duration = time.time() - start_time
+messagebox.showinfo("Completado", f"✅ Archivo generado:\n{output_path}\nTiempo: {duration:.2f} segundos")
