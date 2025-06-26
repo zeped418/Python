@@ -1,0 +1,18 @@
+<div class="screen">
+    <h1>Pokédex</h1>
+    <form method="POST">
+      <input type="text" name="pokemon" placeholder="Nombre o número" required>
+      <button name="search" type="submit">Buscar</button>
+      {% if pokemon %}
+        <input type="hidden" name="current_id" value="{{ pokemon.id }}">
+        <div class="nav-buttons">
+          <button name="prev" type="submit">⏪ Anterior</button>
+          <button name="next" type="submit">Siguiente ⏩</button>
+        </div>
+      {% endif %}
+    </form>
+    {% if pokemon %}
+      <p><strong>ID:</strong> #{{ pokemon.id }}</p>
+    {% endif %}
+  </div>
+  
